@@ -8,14 +8,22 @@ from models.dropbox_meta_models import UpdateDropboxSignConfigRequest
 from models.dropbox_models import SignerInfo
 # from pydantic import EmailStr
 
-from fastapi import APIRouter, HTTPException, UploadFile, Depends, Response, Body, status, File
+from fastapi import APIRouter, HTTPException, UploadFile, Depends, Response, Body, status, File, Request, Form
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
-
+import logging
 from config import settings
+import json
 # from auth.jwt_auth import get_private_key, get_jwt_token
 
-from dropbox_sign import ApiClient, ApiException, Configuration, apis, models
+from dropbox_sign import ApiClient, ApiException, Configuration, apis, models, EventCallbackRequest, EventCallbackHelper, ApiException
+
+class WebHookInfo(BaseModel):
+  event: dict
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 router = APIRouter()
 
@@ -87,9 +95,7 @@ async def create_template_embed_url(
     base_document: UploadFile = File(...),
 ):
     try:
-        # Read the uploaded document file and encode it in Base64
         file_content = await base_document.read()
-        # doc_b64 = base64.b64encode(file_content).decode("ascii")
 
         configuration = Configuration(
             username=settings.db_api_key,
@@ -98,19 +104,43 @@ async def create_template_embed_url(
         with ApiClient(configuration) as api_client:
             template_api = apis.TemplateApi(api_client)
 
+            role_1 = models.SubTemplateRole(
+                name="Client",
+                order=0,
+            )
+
+            role_2 = models.SubTemplateRole(
+                name="Witness",
+                order=1,
+            )
+
+            merge_field_1 = models.SubMergeField(
+                name="Full Name",
+                type="text",
+            )
+
+            merge_field_2 = models.SubMergeField(
+                name="Is Registered?",
+                type="checkbox",
+            )
+
+            field_options = models.SubFieldOptions(
+                date_format="DD - MM - YYYY",
+            )
+
             data = models.TemplateCreateEmbeddedDraftRequest(
                 client_id="2ecad39961dd373ec1957cf7f7d36240",
-                files=[file_content],
-                title=template_name,
+                files=[open("./app/static/demo_documents/World_Wide_Corp_lorem.pdf", "rb")],
+                title="Test Template",
                 subject="Please sign this document",
                 message="For your approval",
-                # signer_roles=[role_1, role_2],
-                # cc_roles=["Manager"],
-                # merge_fields=[merge_field_1, merge_field_2],
-                # merge_fields=[merge_field_1],
-                # field_options=field_options,
+                signer_roles=[role_1, role_2],
+                cc_roles=["Manager"],
+                merge_fields=[merge_field_1, merge_field_2],
+                field_options=field_options,
                 test_mode=True,
             )
+
             response = template_api.template_create_embedded_draft(data)
             return response
 
@@ -121,62 +151,39 @@ async def create_template_embed_url(
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
+@router.post("/webhook")
+async def dropbox_sign_webhook(request: Request):
+    try:
+        # Read the multipart form-data request body
+        form_data = await request.form()
+        json_data = json.loads(form_data.get("json"))  # Extract the 'json' field
 
+        if not json_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing 'json' field in webhook payload.",
+            )
 
+        # Verify and parse the webhook event using Dropbox Sign's SDK helper
+        try:
+            event = EventCallbackRequest.init(json_data)
+        except ApiException as e:
+            logging.error(f"Error verifying webhook event: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or unverified webhook event.",
+            )
 
+        # Log the event type
+        event_type = EventCallbackHelper.get_callback_type(event)
+        logging.info(f"Received Dropbox Sign event: {event_type}")
 
-# @router.get("/create-template-draft")
-# async def create_template_draft():
-#     configuration = Configuration(
-#         # Configure HTTP basic authorization: api_key
-#         username=settings.db_api_key,
-#         # or, configure Bearer (JWT) authorization: oauth2
-#         # access_token="YOUR_ACCESS_TOKEN",
-#     )
+        # Respond to acknowledge the webhook
+        return {"status": "success", "message": f"Event {event_type} logged successfully."}
 
-#     with ApiClient(configuration) as api_client:
-#         template_api = apis.TemplateApi(api_client)
-
-#         role_1 = models.SubTemplateRole(
-#             name="Client",
-#             order=0,
-#         )
-
-#         role_2 = models.SubTemplateRole(
-#             name="Witness",
-#             order=1,
-#         )
-
-#         merge_field_1 = models.SubMergeField(
-#             name="Full Name",
-#             type="text",
-#         )
-
-#         merge_field_2 = models.SubMergeField(
-#             name="Is Registered?",
-#             type="checkbox",
-#         )
-
-#         # field_options = models.SubFieldOptions(
-#         #     date_format="DD - MM - YYYY",
-#         # )
-
-#         data = models.TemplateCreateEmbeddedDraftRequest(
-#             client_id="2dd405972dfd70e4f9f06cf8c525aff1",
-#             files=[open("./app/static/demo_documents/World_Wide_Corp_lorem.pdf", "rb")],
-#             title="Test Template",
-#             subject="Please sign this document",
-#             message="For your approval",
-#             signer_roles=[role_1, role_2],
-#             # cc_roles=["Manager"],
-#             # merge_fields=[merge_field_1, merge_field_2],
-#             merge_fields=[merge_field_1],
-#             # field_options=field_options,
-#             test_mode=True,
-#         )
-
-#         try:
-#             response = template_api.template_create_embedded_draft(data)
-#             return response
-#         except ApiException as e:
-#             return ("Exception when calling Dropbox Sign API: %s\n" % e)
+    except Exception as e:
+        logging.error(f"Error handling webhook: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while processing the webhook.",
+        )
